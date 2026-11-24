@@ -23,14 +23,31 @@ class DataReportService(BaseModuleService):
     ACTION_RULES = {"发布报告": "已发布", "停用报告": "已停用"}
     NEGATIVE_ACTIONS = []
 
-    def generate(self, report_id: int) -> dict[str, Any]:
-        """生成一次数据报告。"""
+    def generate(
+        self,
+        report_id: int,
+        dispatch_process: str = "提前复核",
+        shift_label: str = "",
+    ) -> dict[str, Any]:
+        """生成一次数据报告，并按当次归因数据签发本班巡检行动记录。
+
+        dispatch_process：财务流程选择（提前复核 / 待二次观测），
+        两种流程形成的巡检单都记录采样依据；已签发的巡检单保留原分派记录。
+        """
         report = db.fetchone("SELECT * FROM reports WHERE id=?", [report_id])
         if report is None:
             return {"ok": False, "message": f"报告 {report_id} 不存在"}
 
-        result = generate_report(dict(report))
-        return {"ok": True, "report_name": result["report_name"], "summary": result["summary"]}
+        result = generate_report(
+            dict(report), dispatch_process=dispatch_process, shift_label=shift_label)
+        return {
+            "ok": True,
+            "report_name": result["report_name"],
+            "summary": result["summary"],
+            "output_id": result["id"],
+            "inspection_records": result.get("inspection_records", []),
+            "insufficient_records": result.get("insufficient_records", []),
+        }
 
     def recent_outputs(self, report_id: int, limit: int = 10) -> list[dict[str, Any]]:
         """获取报告的历史生成结果。"""
@@ -88,4 +105,7 @@ class DataReportService(BaseModuleService):
         snapshot = super().domain_snapshot()
         snapshot["total_reports"] = db.count("reports")
         snapshot["total_outputs"] = db.count("report_outputs")
+        snapshot["inspection_orders"] = db.count("inspection_orders")
+        snapshot["dispatchable_orders"] = db.count(
+            "inspection_orders", "dispatch_status='可派复核'")
         return snapshot

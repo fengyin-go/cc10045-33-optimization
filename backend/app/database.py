@@ -200,6 +200,56 @@ DDL_STATEMENTS = [
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )""",
 
+    # 归因结果快照：每次分析按选中异常时间点的时点数据落一条，
+    # 保留样本充足 / 零基线 / 样本不足三类归因数据，后补观测不改写历史结论
+    """CREATE TABLE IF NOT EXISTS anomaly_attributions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        analysis_id INTEGER NOT NULL,
+        target_name TEXT NOT NULL,
+        selected_time TEXT NOT NULL,
+        target_time TEXT,
+        actual_value REAL,
+        z_score REAL,
+        data_status TEXT NOT NULL DEFAULT '样本不足',
+        baseline_count INTEGER NOT NULL DEFAULT 0,
+        baseline_zero_count INTEGER NOT NULL DEFAULT 0,
+        baseline_mean REAL,
+        baseline_std REAL,
+        sample_window_start TEXT,
+        sample_window_end TEXT,
+        anomaly_kind TEXT NOT NULL DEFAULT '',
+        review_decision TEXT NOT NULL DEFAULT '',
+        attribution_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (analysis_id) REFERENCES anomaly_analyses(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_attr_analysis ON anomaly_attributions(analysis_id)",
+
+    # 巡检行动记录：数据报告按当次归因数据签发；一经签发保留原分派记录，
+    # 后续补采、重试或重新生成报告都不改写已签单的派单对象
+    """CREATE TABLE IF NOT EXISTS inspection_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_output_id INTEGER,
+        analysis_id INTEGER NOT NULL,
+        shift_label TEXT NOT NULL DEFAULT '',
+        target_name TEXT NOT NULL,
+        target_time TEXT NOT NULL DEFAULT '',
+        actual_value REAL,
+        z_score REAL,
+        data_status TEXT NOT NULL DEFAULT '',
+        baseline_count INTEGER NOT NULL DEFAULT 0,
+        baseline_zero_count INTEGER NOT NULL DEFAULT 0,
+        sample_window_start TEXT,
+        sample_window_end TEXT,
+        dispatch_process TEXT NOT NULL DEFAULT '',
+        dispatch_status TEXT NOT NULL DEFAULT '',
+        dispatch_note TEXT NOT NULL DEFAULT '',
+        issued_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (analysis_id) REFERENCES anomaly_analyses(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_orders_analysis ON inspection_orders(analysis_id)",
+
     # ==================== Forecast Tier ====================
     """CREATE TABLE IF NOT EXISTS forecast_tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

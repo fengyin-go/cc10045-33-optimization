@@ -1,14 +1,16 @@
 """数据分析管道路由：事件采集、聚合执行、指标快照、分群计算等核心操作入口。"""
 from __future__ import annotations
 
-from fastapi import APIRouter
+from typing import Any
+
+from fastapi import APIRouter, Body
 
 from app.database import db
 from app.pipeline import (
-    check_alert, compute_aggregation, compute_cohort_comparison,
-    compute_forecast, compute_funnel, compute_metric_snapshot,
-    compute_retention, compute_segment, generate_report,
-    ingest_events, precompute_cube, seed_real_data,
+    _normalize_anomaly_time, check_alert, compute_aggregation,
+    compute_cohort_comparison, compute_forecast, compute_funnel,
+    compute_metric_snapshot, compute_retention, compute_segment,
+    generate_report, ingest_events, precompute_cube, seed_real_data,
 )
 from app.services import service_for
 
@@ -50,6 +52,67 @@ def api_compute_all_metrics() -> dict:
     """对所有指标执行快照计算。"""
     svc = service_for("metric_store")
     return svc.compute_all()
+
+
+@router.post("/metrics/register")
+def api_register_metric(payload: dict[str, Any] = Body(default={})) -> dict:
+    """登记一个指标定义（幂等），供采样与归因使用。"""
+    name = str(payload.get("metric_name") or "").strip()
+    if not name:
+        return {"ok": False, "message": "缺少 metric_name"}
+    existing = db.fetchone("SELECT * FROM metrics WHERE metric_name=?", [name])
+    if existing:
+        return {"ok": True, "message": "指标已存在", "metric": existing}
+    metric_type = str(payload.get("metric_type") or "counter")
+    if metric_type not in ("counter", "gauge", "ratio", "composite"):
+        metric_type = "counter"
+    metric_id = db.insert("metrics", {
+        "metric_name": name,
+        "metric_type": metric_type,
+        "source_module": str(payload.get("source_module") or "metric_store"),
+        "calibration_version": int(payload.get("calibration_version") or 1),
+        "unit": str(payload.get("unit") or ""),
+    })
+    return {"ok": True, "metric": db.fetchone("SELECT * FROM metrics WHERE id=?", [metric_id])}
+
+
+@router.post("/metrics/{metric_id}/observe")
+def api_observe_metric(metric_id: int, payload: dict[str, Any] = Body(default={})) -> dict:
+    """记录一次观测快照（补采/重试都走这里）。
+
+    显式给定快照时间的补采只影响该时间口径的归因；已签发的巡检单不受
+    后续补采、失败或重试影响。观测本身不打标准分，异常判断由归因管线完成。
+    """
+    metric = db.fetchone("SELECT * FROM metrics WHERE id=?", [metric_id])
+    if metric is None:
+        return {"ok": False, "message": f"指标 {metric_id} 不存在"}
+    if "value" not in payload:
+        return {"ok": False, "message": "缺少观测值 value"}
+    try:
+        value = float(payload.get("value"))
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "观测值 value 不是数字"}
+
+    snapshot_time = _normalize_anomaly_time(payload.get("snapshot_time")) \
+        if payload.get("snapshot_time") else db.now()
+    baseline = db.fetchone(
+        "SELECT snapshot_value FROM metric_values WHERE metric_id=? AND snapshot_time<? "
+        "ORDER BY snapshot_time DESC, id DESC LIMIT 1",
+        [metric_id, snapshot_time],
+    )
+    row_id = db.insert("metric_values", {
+        "metric_id": metric_id,
+        "snapshot_value": value,
+        "snapshot_time": snapshot_time,
+        "calibration_version": metric.get("calibration_version", 1),
+        "baseline_value": baseline["snapshot_value"] if baseline else None,
+        "comparison_status": "已保存",
+        "z_score": None,
+    })
+    return {
+        "ok": True,
+        "observation": db.fetchone("SELECT * FROM metric_values WHERE id=?", [row_id]),
+    }
 
 
 @router.post("/metrics/{metric_id}/snapshot")
@@ -101,11 +164,48 @@ def api_precompute_cube(cube_id: int) -> dict:
     return svc.run_precomputation(cube_id)
 
 
+@router.post("/anomaly/{analysis_id}/run")
+def api_run_anomaly_analysis(analysis_id: int) -> dict:
+    """对指定归因分析器执行一次按选中异常时间的归因分析。"""
+    svc = service_for("anomaly_analysis")
+    return svc.run_analysis(analysis_id)
+
+
+@router.get("/anomaly/{analysis_id}/attribution")
+def api_anomaly_attribution(analysis_id: int) -> dict:
+    """重新打开某次分析的归因数据（时点口径，不受后续补采影响）。"""
+    svc = service_for("anomaly_analysis")
+    return svc.latest_attribution(analysis_id)
+
+
+@router.get("/inspection/orders")
+def api_inspection_orders(analysis_id: int | None = None) -> dict:
+    """查询已签发的巡检行动记录（已签单保留原分派记录）。"""
+    if analysis_id is not None:
+        rows = db.fetchall(
+            "SELECT * FROM inspection_orders WHERE analysis_id=? ORDER BY id",
+            [analysis_id],
+        )
+    else:
+        rows = db.fetchall("SELECT * FROM inspection_orders ORDER BY id DESC LIMIT 100")
+    return {"ok": True, "total": len(rows), "orders": rows}
+
+
 @router.post("/report/{report_id}/generate")
-def api_generate_report(report_id: int) -> dict:
-    """对指定报告模板执行生成。"""
+def api_generate_report(
+    report_id: int,
+    payload: dict[str, Any] = Body(default={}),
+) -> dict:
+    """对指定报告模板执行生成，并按当次归因数据签发本班巡检单。
+
+    可选 body：dispatch_process（提前复核 / 待二次观测）、shift_label（班次）。
+    """
     svc = service_for("data_report")
-    return svc.generate(report_id)
+    return svc.generate(
+        report_id,
+        dispatch_process=str(payload.get("dispatch_process") or "提前复核"),
+        shift_label=str(payload.get("shift_label") or ""),
+    )
 
 
 @router.post("/alerts/check-all")

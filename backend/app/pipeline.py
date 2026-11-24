@@ -593,14 +593,62 @@ def compute_retention(task: dict[str, Any]) -> list[dict[str, Any]]:
 # 异常检测管道
 # ============================================================================
 
-def detect_anomaly(analysis: dict[str, Any]) -> dict[str, Any]:
-    """对指定指标执行多维度异常检测和归因分析。
+# 构成稳定基线所需的最少历史样本数；少于此值不出标准分，避免极小分母误判
+MIN_BASELINE_SAMPLES = 5
 
-    从 metric_values 表获取历史值，计算移动平均和标准差，
-    检测当前值是否超出 3-sigma 范围，并按维度拆解贡献度。
+
+def _normalize_anomaly_time(raw: Any) -> str:
+    """把选中的异常时间规整为 ISO 秒级字符串，便于按 snapshot_time 比较。
+
+    支持 "YYYY-MM-DDTHH:MM[:SS]"、"YYYY-MM-DD HH:MM" 和纯日期（按当日末尾计）。
+    无法解析时退回当前时间，保持旧行为（按最新快照归因）。
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return db.now()
+    s = s.replace("/", "-").replace(" ", "T")
+    for fmt, end_of_day in (
+        ("%Y-%m-%dT%H:%M:%S", False),
+        ("%Y-%m-%dT%H:%M", False),
+        ("%Y-%m-%d", True),
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59)
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    return db.now()
+
+
+def _dimension_contributions(dims: list[Any]) -> dict[str, float]:
+    """按归因维度从聚合结果中拆解贡献度。"""
+    contributions: dict[str, float] = {}
+    for dim in dims or []:
+        agg_rows = db.fetchall(
+            "SELECT dimension_key, SUM(computed_value) as total FROM aggregation_results "
+            "WHERE dimension_key LIKE ? GROUP BY dimension_key",
+            [f"%{dim}%"],
+        )
+        total_all = sum(r["total"] for r in agg_rows)
+        if total_all > 0:
+            for r in agg_rows:
+                contributions[r["dimension_key"]] = round(r["total"] / total_all, 4)
+    return contributions
+
+
+def detect_anomaly(analysis: dict[str, Any]) -> dict[str, Any]:
+    """对指定指标按选中的异常时间点执行归因分析。
+
+    时点口径：目标观测取不晚于选中异常时间的最新快照，基线为目标观测之前
+    的历史样本（真正为零的样本保留，不删除）；后补写的新观测不会挪进旧时间
+    的基线。样本不足或基线零方差（含零基线）时不出标准分，避免用极小分母把
+    零基线的第一次变化误判成有标准分的普通异常；三类情况（样本充足、零基线、
+    资料尚缺）都保留归因数据。
     """
     target_name = analysis.get("分析对象", analysis.get("target_name", ""))
-    anomaly_time = analysis.get("异常时间点", analysis.get("anomaly_time", db.now()))
+    anomaly_time_raw = analysis.get("异常时间点", analysis.get("anomaly_time", db.now()))
     dims_raw = analysis.get("归因维度", analysis.get("attribution_dimensions", "[]"))
 
     try:
@@ -608,61 +656,156 @@ def detect_anomaly(analysis: dict[str, Any]) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         dims = []
 
-    # 从 metric_values 读取历史
-    metric = db.fetchone("SELECT id FROM metrics WHERE metric_name LIKE ?", [f"%{target_name}%"])
+    selected_time = _normalize_anomaly_time(anomaly_time_raw)
+
+    metric = db.fetchone("SELECT * FROM metrics WHERE metric_name LIKE ?", [f"%{target_name}%"])
     if not metric:
         return {"status": "分析失败", "reason": f"未找到指标: {target_name}"}
 
     metric_id = metric["id"]
-    all_snapshots = db.fetchall(
-        "SELECT * FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 60",
-        [metric_id],
+    # 只读取不晚于选中异常时间的快照：后补写的新观测不会挪进旧时间基线
+    rows = db.fetchall(
+        "SELECT * FROM metric_values WHERE metric_id=? AND snapshot_time<=? "
+        "ORDER BY snapshot_time DESC, id DESC LIMIT 200",
+        [metric_id, selected_time],
     )
+    # 同一采样时间的补采/重试只保留最新写入的一条，避免重复样本污染基线
+    snapshots: list[dict[str, Any]] = []
+    seen_times: set[str] = set()
+    for row in rows:
+        if row["snapshot_time"] in seen_times:
+            continue
+        seen_times.add(row["snapshot_time"])
+        snapshots.append(row)
+        if len(snapshots) >= 60:
+            break
 
-    if len(all_snapshots) < 10:
-        return {"status": "分析失败", "reason": "历史数据不足（< 10 条快照）"}
-
-    values = [s["snapshot_value"] for s in all_snapshots]
-    latest = values[0]
-    historical = values[1:]
-    mean_v = statistics.mean(historical)
-    std_v = statistics.stdev(historical) if len(historical) > 1 else 0.0001
-
-    z_score = round((latest - mean_v) / max(std_v, 1e-8), 4)
-
-    # 按维度归因
-    contributions: dict[str, float] = {}
-    if dims:
-        for dim in dims:
-            agg_rows = db.fetchall(
-                "SELECT dimension_key, SUM(computed_value) as total FROM aggregation_results "
-                "WHERE dimension_key LIKE ? GROUP BY dimension_key",
-                [f"%{dim}%"],
-            )
-            total_all = sum(r["total"] for r in agg_rows)
-            if total_all > 0:
-                for r in agg_rows:
-                    contributions[r["dimension_key"]] = round(r["total"] / total_all, 4)
-
-    conclusion = "未检测到显著异常"
-    if abs(z_score) >= 3:
-        top_contributors = sorted(contributions.items(), key=lambda x: -x[1])[:3]
-        conclusion = f"检测到显著异常(z={z_score})，主要贡献维度: {json.dumps(top_contributors, ensure_ascii=False)}"
-
-    result = {
+    contributions = _dimension_contributions(dims)
+    base: dict[str, Any] = {
         "target_name": target_name,
-        "anomaly_time": anomaly_time,
-        "z_score": z_score,
-        "is_anomaly": abs(z_score) >= 3,
-        "mean": round(mean_v, 4),
-        "std": round(std_v, 4),
-        "latest_value": latest,
+        "metric_id": metric_id,
+        "selected_time": selected_time,
+        "anomaly_time": selected_time,
         "contributions": contributions,
-        "conclusion": conclusion,
-        "status": "已完成" if abs(z_score) >= 3 else "已完成",
     }
 
-    return result
+    if not snapshots:
+        conclusion = f"选中时间 {selected_time} 及之前无有效观测，无法归因"
+        return {
+            **base, "status": "已完成", "data_status": "无有效观测",
+            "target_time": None, "actual_value": None, "z_score": None,
+            "is_anomaly": False, "first_change": False, "needs_review": False,
+            "anomaly_kind": "", "baseline_count": 0, "baseline_zero_count": 0,
+            "baseline_mean": None, "baseline_std": None,
+            "sample_window_start": None, "sample_window_end": None,
+            "review_decision": "样本不足暂缓", "eligible_processes": [],
+            "reason": "目标时间之前没有任何观测快照",
+            "conclusion": conclusion,
+        }
+
+    target = snapshots[0]
+    actual_value = target["snapshot_value"]
+    actual_time = target["snapshot_time"]  # 实际目标时间（可能与选中时间有偏差）
+    baseline_rows = snapshots[1:]
+    baseline_values = [r["snapshot_value"] for r in baseline_rows]  # 零值样本保留
+    baseline_count = len(baseline_values)
+    zero_count = sum(1 for v in baseline_values if v == 0)
+    window_start = baseline_rows[-1]["snapshot_time"] if baseline_rows else None
+    window_end = baseline_rows[0]["snapshot_time"] if baseline_rows else None
+
+    z_score: float | None = None
+    is_anomaly = False
+    first_change = False
+    needs_review = False
+    anomaly_kind = ""
+    reason = ""
+
+    if baseline_count < MIN_BASELINE_SAMPLES:
+        # 资料尚缺：观测不足不能冒充平稳零值，也不能出标准分
+        data_status = "样本不足"
+        review_decision = "样本不足暂缓"
+        reason = (
+            f"基线仅 {baseline_count} 条（需 {MIN_BASELINE_SAMPLES} 条），"
+            f"观测不足，不能判定平稳或异常"
+        )
+        conclusion = (
+            f"样本不足：{actual_time} 实测 {_fmt_num(actual_value)}，"
+            f"基线仅 {baseline_count}/{MIN_BASELINE_SAMPLES} 条，暂无足够样本派复核"
+        )
+    else:
+        mean_v = statistics.mean(baseline_values)
+        std_v = statistics.stdev(baseline_values)
+        if std_v <= 1e-12:
+            # 零方差基线（含零基线）：不能用极小分母造标准分
+            constant = baseline_values[0]
+            first_change = actual_value != constant
+            needs_review = first_change
+            if constant == 0:
+                data_status = "零基线"
+                anomaly_kind = "零基线首次变化" if first_change else ""
+            else:
+                data_status = "恒定基线"
+                anomaly_kind = "恒定基线首次变化" if first_change else ""
+            review_decision = "可派复核" if first_change else "无需派单"
+            if first_change:
+                conclusion = (
+                    f"{actual_time} 实测 {_fmt_num(actual_value)}，为{data_status}首次变化"
+                    f"（基线 {baseline_count} 次均为 {_fmt_num(constant)}，其中零值 {zero_count} 次），"
+                    f"无可用标准分；可按提前复核流程派单，或待第二次有效观测"
+                )
+            else:
+                conclusion = (
+                    f"基线 {baseline_count} 次均为 {_fmt_num(constant)}，"
+                    f"{actual_time} 实测未偏离，零值样本真实保留，零基线延续平稳"
+                    if constant == 0 else
+                    f"基线 {baseline_count} 次均为 {_fmt_num(constant)}，"
+                    f"{actual_time} 实测未偏离，恒定基线延续平稳"
+                )
+        else:
+            data_status = "样本充足"
+            z_score = round((actual_value - mean_v) / std_v, 4)
+            is_anomaly = abs(z_score) >= 3
+            needs_review = is_anomaly
+            anomaly_kind = "标准分异常" if is_anomaly else ""
+            review_decision = "可派复核" if is_anomaly else "无需派单"
+            if is_anomaly:
+                top = sorted(contributions.items(), key=lambda x: -x[1])[:3]
+                conclusion = (
+                    f"检测到显著异常(z={z_score})，{actual_time} 实测 "
+                    f"{_fmt_num(actual_value)}，基线均值 {round(mean_v, 4)}，"
+                    f"主要贡献维度: {json.dumps(top, ensure_ascii=False)}"
+                )
+            else:
+                conclusion = f"未检测到显著异常(z={z_score}，|z|<3)"
+
+    return {
+        **base, "status": "已完成", "data_status": data_status,
+        "target_time": actual_time, "actual_value": actual_value,
+        "z_score": z_score, "is_anomaly": is_anomaly,
+        "first_change": first_change, "needs_review": needs_review,
+        "anomaly_kind": anomaly_kind,
+        "baseline_count": baseline_count, "baseline_zero_count": zero_count,
+        "baseline_mean": round(statistics.mean(baseline_values), 4) if baseline_values else None,
+        "baseline_std": round(statistics.stdev(baseline_values), 4) if baseline_count > 1 else None,
+        "sample_window_start": window_start, "sample_window_end": window_end,
+        "review_decision": review_decision,
+        "eligible_processes": ["提前复核", "待二次观测"] if needs_review else [],
+        "reason": reason,
+        "conclusion": conclusion,
+        # 兼容旧字段
+        "mean": round(statistics.mean(baseline_values), 4) if baseline_values else None,
+        "std": round(statistics.stdev(baseline_values), 4) if baseline_count > 1 else None,
+        "latest_value": actual_value,
+    }
+
+
+def _fmt_num(value: Any) -> str:
+    """数值展示：整数值不带小数点。"""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return f"{f:g}"
 
 
 # ============================================================================
@@ -851,11 +994,17 @@ def _extract_dim_values(members: list[dict[str, Any]], dim: str) -> list[float]:
 # 报告生成管道
 # ============================================================================
 
-def generate_report(report: dict[str, Any]) -> dict[str, Any]:
+def generate_report(
+    report: dict[str, Any],
+    dispatch_process: str = "提前复核",
+    shift_label: str = "",
+) -> dict[str, Any]:
     """按报告模板生成数据报告。
 
-    读取关联指标的最新值，组装成结构化报告内容，写入 report_outputs 表。
-    支持 JSON 和 CSV 格式输出。
+    读取关联指标的最新值组装结构化内容；同时按当次归因数据生成巡检行动
+    记录，给现场主管标明哪项能派复核、哪项尚无足够样本（缺资料单列）。
+    巡检单一经签发保留原分派记录：后续补采、失败重试或重新生成报告，
+    都只引用已签单，不改写第一次的派单对象。
     """
     report_id = report["id"]
     metric_ids_raw = report.get("包含指标集", report.get("metric_ids", "[]"))
@@ -869,63 +1018,215 @@ def generate_report(report: dict[str, Any]) -> dict[str, Any]:
     sections: list[dict[str, Any]] = []
 
     if metric_ids:
+        scoped_metrics = []
         for mid in metric_ids:
             m = db.fetchone("SELECT * FROM metrics WHERE id=?", [mid])
-            if not m:
-                continue
-            latest = db.fetchone(
-                "SELECT * FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 1",
-                [mid],
-            )
-            section = {
-                "metric_name": m["metric_name"],
-                "metric_type": m["metric_type"],
-                "unit": m["unit"],
-                "current_value": latest["snapshot_value"] if latest else None,
-                "baseline": latest["baseline_value"] if latest else None,
-                "status": latest["comparison_status"] if latest else "unknown",
-            }
-            if latest and latest.get("z_score") is not None:
-                section["z_score"] = latest["z_score"]
-            sections.append(section)
+            if m:
+                scoped_metrics.append(m)
     else:
-        # 汇总所有指标
-        all_metrics = db.fetchall("SELECT * FROM metrics LIMIT 20")
-        for m in all_metrics:
-            latest = db.fetchone(
-                "SELECT * FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 1",
-                [m["id"]],
-            )
-            sections.append({
-                "metric_name": m["metric_name"],
-                "metric_type": m["metric_type"],
-                "current_value": latest["snapshot_value"] if latest else 0,
-                "status": latest["comparison_status"] if latest else "已保存",
-            })
+        scoped_metrics = db.fetchall("SELECT * FROM metrics LIMIT 20")
 
-    report_content = {
+    for m in scoped_metrics:
+        latest = db.fetchone(
+            "SELECT * FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC, id DESC LIMIT 1",
+            [m["id"]],
+        )
+        sample_count = db.count("metric_values", "metric_id=?", [m["id"]])
+        section = {
+            "metric_name": m["metric_name"],
+            "metric_type": m["metric_type"],
+            "current_value": latest["snapshot_value"] if latest else None,
+            "baseline": latest["baseline_value"] if latest else None,
+            "status": latest["comparison_status"] if latest else "无观测",
+            "sample_count": sample_count,
+            # 观测不足不能冒充平稳零值：样本不够的指标单独标注，不计入正常
+            "data_status": "样本充足" if sample_count > MIN_BASELINE_SAMPLES else "样本不足",
+        }
+        if m.get("unit"):
+            section["unit"] = m["unit"]
+        if latest and latest.get("z_score") is not None:
+            section["z_score"] = latest["z_score"]
+        sections.append(section)
+
+    report_content: dict[str, Any] = {
         "report_name": report.get("报告名称", report.get("report_name", "")),
         "generated_at": db.now(),
+        "shift_label": shift_label,
         "sections": sections,
         "summary": {
             "total_metrics": len(sections),
             "abnormal_count": sum(1 for s in sections if s.get("status") == "有异常"),
-            "normal_count": sum(1 for s in sections if s.get("status") == "已保存"),
+            "normal_count": sum(
+                1 for s in sections
+                if s.get("status") == "已保存" and s.get("data_status") == "样本充足"
+            ),
+            "insufficient_count": sum(1 for s in sections if s.get("data_status") == "样本不足"),
         },
     }
 
-    content_str = json.dumps(report_content, ensure_ascii=False, indent=2)
-
+    # 先落报告输出拿到 output_id，供巡检行动记录引用
     output_id = db.insert("report_outputs", {
         "report_id": report_id,
-        "output_content": content_str,
+        "output_content": json.dumps(report_content, ensure_ascii=False),
     })
+
+    # 巡检行动记录：按当次归因数据生成；缺资料的指标单列
+    inspection_records, insufficient_records = _build_inspection_records(
+        output_id, metric_ids, dispatch_process, shift_label,
+    )
+    report_content["inspection_records"] = inspection_records
+    report_content["insufficient_records"] = insufficient_records
+    report_content["summary"]["dispatchable_count"] = sum(
+        1 for r in inspection_records if r["dispatch_status"] == "可派复核")
+    report_content["summary"]["pending_observation_count"] = sum(
+        1 for r in inspection_records if r["dispatch_status"] == "待二次观测")
+    report_content["summary"]["insufficient_attribution_count"] = len(insufficient_records)
+
+    db.update(
+        "report_outputs",
+        {"output_content": json.dumps(report_content, ensure_ascii=False, indent=2)},
+        "id=?", [output_id],
+    )
 
     return {
         "id": output_id,
         "report_name": report_content["report_name"],
         "format": output_format,
         "summary": report_content["summary"],
+        "inspection_records": inspection_records,
+        "insufficient_records": insufficient_records,
+    }
+
+
+def _build_inspection_records(
+    output_id: int,
+    metric_ids: list[Any],
+    dispatch_process: str,
+    shift_label: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """按当次归因数据生成巡检行动记录。
+
+    已完成分析取最新一条归因结果；已签发的巡检单直接引用原分派记录，
+    未签发的按本次报告选择的流程签发新单。返回（可行动记录, 缺资料单列）。
+    """
+    analyses = db.fetchall(
+        "SELECT * FROM anomaly_analyses WHERE status='已完成' ORDER BY id",
+    )
+    actionable: list[dict[str, Any]] = []
+    insufficient: list[dict[str, Any]] = []
+
+    for analysis in analyses:
+        attr = db.fetchone(
+            "SELECT * FROM anomaly_attributions WHERE analysis_id=? ORDER BY id DESC LIMIT 1",
+            [analysis["id"]],
+        )
+        if not attr:
+            continue
+        if metric_ids:
+            metric = db.fetchone(
+                "SELECT id FROM metrics WHERE metric_name LIKE ?",
+                [f"%{analysis['target_name']}%"],
+            )
+            if not metric or metric["id"] not in metric_ids:
+                continue
+
+        order = db.fetchone(
+            "SELECT * FROM inspection_orders WHERE analysis_id=? ORDER BY id LIMIT 1",
+            [analysis["id"]],
+        )
+        if order is None:
+            order_id = _create_inspection_order(
+                output_id, analysis, attr, dispatch_process, shift_label)
+            order = db.fetchone("SELECT * FROM inspection_orders WHERE id=?", [order_id])
+
+        record = _order_record(order)
+        if order["data_status"] in ("样本不足", "无有效观测"):
+            insufficient.append(record)  # 缺资料单列
+        else:
+            actionable.append(record)
+
+    return actionable, insufficient
+
+
+def _create_inspection_order(
+    output_id: int,
+    analysis: dict[str, Any],
+    attr: dict[str, Any],
+    dispatch_process: str,
+    shift_label: str,
+) -> int:
+    """按当次归因数据签发一张巡检单；两种流程都记录采样依据。"""
+    data_status = attr["data_status"]
+    if data_status in ("样本不足", "无有效观测"):
+        process, status = "暂不派单", "样本不足暂缓"
+    elif attr["review_decision"] == "可派复核":
+        if dispatch_process == "待二次观测":
+            process, status = "待二次观测", "待二次观测"
+        else:
+            process, status = "提前复核", "可派复核"
+    else:
+        process, status = "无需派单", "无需派单"
+
+    return db.insert("inspection_orders", {
+        "report_output_id": output_id,
+        "analysis_id": analysis["id"],
+        "shift_label": shift_label,
+        "target_name": attr["target_name"],
+        "target_time": attr["target_time"] or attr["selected_time"],
+        "actual_value": attr["actual_value"],
+        "z_score": attr["z_score"],
+        "data_status": data_status,
+        "baseline_count": attr["baseline_count"],
+        "baseline_zero_count": attr["baseline_zero_count"],
+        "sample_window_start": attr["sample_window_start"],
+        "sample_window_end": attr["sample_window_end"],
+        "dispatch_process": process,
+        "dispatch_status": status,
+        "dispatch_note": _dispatch_note(attr, process),
+        "issued_at": db.now(),
+    })
+
+
+def _dispatch_note(attr: dict[str, Any], process: str) -> str:
+    """巡检单采样依据：实际目标时间、实测值、标准分（可能无）、基线构成与有效采样范围。"""
+    z = attr["z_score"]
+    basis = (
+        f"采样依据：目标时间 {attr['target_time'] or attr['selected_time']}，"
+        f"实测 {_fmt_num(attr['actual_value'])}，"
+        f"标准分 {'无' if z is None else z}，"
+        f"基线 {attr['baseline_count']} 次（零值 {attr['baseline_zero_count']} 次），"
+        f"有效采样范围 {attr['sample_window_start'] or '无'}~{attr['sample_window_end'] or '无'}"
+    )
+    if process == "暂不派单":
+        return basis + "；样本不足，观测不足不能视为平稳零值，暂缓派单"
+    if process == "待二次观测":
+        if "首次变化" in (attr["anomaly_kind"] or ""):
+            return basis + "；首次变化无可用标准分，按流程待第二次有效观测后派出复核"
+        return basis + "；按流程待第二次有效观测确认后派出复核"
+    if process == "提前复核":
+        return basis + "；按提前复核流程派现场复核"
+    return basis + "；本次无需派单"
+
+
+def _order_record(order: dict[str, Any]) -> dict[str, Any]:
+    """巡检单在报告内容中的序列化形态。"""
+    return {
+        "order_id": order["id"],
+        "analysis_id": order["analysis_id"],
+        "shift_label": order["shift_label"],
+        "target_name": order["target_name"],
+        "target_time": order["target_time"],
+        "actual_value": order["actual_value"],
+        "z_score": order["z_score"],
+        "data_status": order["data_status"],
+        "baseline_count": order["baseline_count"],
+        "baseline_zero_count": order["baseline_zero_count"],
+        "sample_window_start": order["sample_window_start"],
+        "sample_window_end": order["sample_window_end"],
+        "dispatch_process": order["dispatch_process"],
+        "dispatch_status": order["dispatch_status"],
+        "dispatch_note": order["dispatch_note"],
+        "issued_at": order["issued_at"],
     }
 
 

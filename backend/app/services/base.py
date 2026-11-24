@@ -94,7 +94,7 @@ class BaseModuleService:
         for field in self.LIST_FIELDS:
             col = _to_column_name(field)
             data[col] = values.get(field, "")
-        if "name" not in data and self.LIST_FIELDS:
+        if "name" not in data and self.LIST_FIELDS and _has_column(table, "name"):
             data["name"] = values.get(self.LIST_FIELDS[0], "")
         data["status"] = self.STATUS_ORDER[0]
 
@@ -127,6 +127,15 @@ class BaseModuleService:
             "by_status": by_status,
             "abnormal": 0,
         }
+
+
+def _has_column(table: str, column: str) -> bool:
+    """检查表是否真有该列，避免向不存在的列写入。"""
+    try:
+        rows = db.fetchall(f"PRAGMA table_info({table})")
+    except Exception:
+        return False
+    return any(r.get("name") == column for r in rows)
 
 
 def _to_column_name(chinese_field: str) -> str:
